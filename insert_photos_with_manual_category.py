@@ -7,7 +7,6 @@ import shutil
 import hashlib
 from datetime import datetime
 from PIL import Image, UnidentifiedImageError
-from openai import OpenAI
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -18,9 +17,7 @@ except AttributeError:
 # ================= CONFIG =================
 DEFAULT_DB_PATH = r"D:\Nvisions OneDrive\OneDrive\TheTimeThen-Data\databases\image_collection.db"
 DB_NAME = os.environ.get("THETIME_THEN_DB", DEFAULT_DB_PATH)
-TABLE_NAME = "image_comp"  # ← CHANGED: now uses image_comp
-MODEL = "gpt-4o-mini"
-TEMPERATURE = 0.1
+TABLE_NAME = "image_comp"
 VISUAL_DUPLICATE_DISTANCE_THRESHOLD = 6
 
 CATEGORIES = [
@@ -41,11 +38,6 @@ CATEGORIES = [
     "Everyday Life"
 ]
 # =========================================
-
-api_key = os.environ.get("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key) if api_key else None
-
-
 
 
 # ---------- DATABASE CONNECTION ----------
@@ -69,45 +61,6 @@ def connect_to_db(db_path=None):
 
     print(f"✅ Connected to database '{target_db}' → table '{TABLE_NAME}' found.")
     return conn
-
-
-# ---------- AI CATEGORY ----------
-def classify_description(description):
-    prompt = f"""
-You are classifying historical photo descriptions.
-
-Choose EXACTLY ONE category from the list below.
-Return ONLY the category name.
-
-Categories:
-{', '.join(CATEGORIES)}
-
-Description:
-{description}
-
-Category:
-"""
-    if client is None:
-        print("⚠️ OPENAI_API_KEY is not set; defaulting to 'Everyday Life' for AI category.")
-        return "Everyday Life"
-
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=TEMPERATURE
-        )
-        content = response.choices[0].message.content
-        result = (content or "").strip()
-
-        if result not in CATEGORIES:
-            return "Everyday Life"
-
-        return result
-    except Exception as e:
-        print(f"⚠️ AI classification failed for description: {e}")
-        print("   Defaulting to 'Everyday Life'")
-        return "Everyday Life"
 
 
 # ---------- MAIN LOGIC ----------
@@ -271,21 +224,34 @@ def build_duplicate_index(cursor):
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Insert extracted photos into the shared TheTimeThen database with AI categories.")
+    parser = argparse.ArgumentParser(
+        description="Insert extracted photos into the shared TheTimeThen database, "
+                    "using a manually-specified category for ALL inserted photos "
+                    "(no AI classification)."
+    )
     parser.add_argument("image_dir", help="Folder containing extracted images")
     parser.add_argument("descriptions_file", help="Text file with numbered description entries")
+    parser.add_argument(
+        "category",
+        help=f"Category to assign to every inserted photo. One of: {', '.join(CATEGORIES)} "
+             "(any other value is accepted too, but won't match the standard category list)."
+    )
     parser.add_argument("-test", "--test", type=int, help="Only insert the first N photos")
     parser.add_argument("--db", default=os.environ.get("THETIME_THEN_DB", DEFAULT_DB_PATH), help="SQLite database path to insert into")
     parser.add_argument("--keep-output", action="store_true", help="Keep the image folder and text-file parent folder after insertion")
+    parser.add_argument("--force-category", action="store_true", help="Allow a category not in the standard CATEGORIES list without prompting")
     args = parser.parse_args()
-
-    if not api_key:
-        print("⚠️ OPENAI_API_KEY is not set; AI categorization will default to 'Everyday Life'.")
 
     image_dir = args.image_dir
     desc_file = args.descriptions_file
     test_limit = args.test
     db_path = args.db
+    category = args.category
+
+    if category not in CATEGORIES and not args.force_category:
+        print(f"⚠️ '{category}' is not in the standard category list: {', '.join(CATEGORIES)}")
+        print("   Re-run with --force-category to use it anyway, or pick one of the standard categories.")
+        sys.exit(1)
 
     if not os.path.isdir(image_dir):
         print(f"❌ Image directory not found: {image_dir}")
@@ -310,6 +276,7 @@ def main():
         f"✅ Duplicate index ready: filenames={len(existing_filenames)}, "
         f"exact_hashes={len(existing_sha_index)}, visual_hashes={len(existing_visual_index)}"
     )
+    print(f"🏷️  Using manual category for all inserts: '{category}'")
 
     for index, text in descriptions.items():
         if test_limit and inserted >= test_limit:
@@ -400,8 +367,6 @@ def main():
             )
             continue
 
-        category = classify_description(text)
-
         try:
             cursor.execute(f"""
                 INSERT INTO {TABLE_NAME} (
@@ -441,7 +406,7 @@ def main():
     if not args.keep_output:
         cleanup_input_path(image_dir)
         cleanup_parent_folder(desc_file)
-    print(f"\n🎉 DONE — Successfully inserted {inserted} new photos into '{TABLE_NAME}' table.")
+    print(f"\n🎉 DONE — Successfully inserted {inserted} new photos into '{TABLE_NAME}' table with category '{category}'.")
 
 
 if __name__ == "__main__":

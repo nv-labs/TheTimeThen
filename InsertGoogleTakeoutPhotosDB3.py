@@ -11,6 +11,7 @@ import sys
 def create_database(db_path):
     """Create a new SQLite database with the required schema."""
     conn = sqlite3.connect(db_path)
+    conn.execute('BEGIN')
     cursor = conn.cursor()
 
     # Create the photos table with additional categories
@@ -75,7 +76,6 @@ def insert_photo(conn, photo_data):
         json.dumps(photo_data['json_metadata']),
         photo_data['VideoAirDate']
     ))
-    conn.commit()
 
 def resolve_image_file(metadata_file, metadata_title):
     """Resolve the real image/video file path for a Google Takeout metadata file."""
@@ -146,6 +146,7 @@ def process_metadata_file(metadata_file):
 def process_images(input_folder, db_path, categories, limit=None):
     """Process images and their metadata from the input folder."""
     conn = sqlite3.connect(db_path)
+    conn.execute('BEGIN')
 
     # Insert categories into the database
     insert_categories(conn, categories)
@@ -185,9 +186,11 @@ def process_images(input_folder, db_path, categories, limit=None):
 
                 if limit and processed_count >= abs(limit):
                     print(f"Processed {processed_count} images (limit reached).")
+                    conn.commit()
                     conn.close()
                     return
 
+    conn.commit()
     print(f"Finished processing {processed_count} images. Skipped {skipped_count} metadata files.")
     conn.close()
 

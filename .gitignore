@@ -36,3 +36,9 @@ duplicate_review/
 *.avi
 *.mkv
 *.mp3
+.env
+_frame.jpg
+_centered_frame.jpg
+_frame_text.jpg
+_frame_image.jpg
+debug_table_dump/

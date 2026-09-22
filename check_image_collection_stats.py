@@ -1,8 +1,9 @@
 import sqlite3
 import os
 
-DB_NAME = "image_collection.db"      # Correct database file
-TABLE_NAME = "image_comp"            # Correct table name
+DB_DIR = r"D:\Nvisions OneDrive\OneDrive\TheTimeThen-Data\databases"
+DB_NAME = os.path.join(DB_DIR, "image_collection.db")
+TABLE_NAME = "image_comp"
 
 def check_db_stats():
     if not os.path.exists(DB_NAME):
@@ -38,7 +39,7 @@ def check_db_stats():
         else:
             min_date = max_date = None
 
-        print(f"📊 Database Statistics for '{DB_NAME}' → table '{TABLE_NAME}':")
+        print(f"Database Statistics for '{DB_NAME}' -> table '{TABLE_NAME}':")
         print(f"   Total images:                {total_rows}")
         print(f"   With VideoAirDate set:       {with_date}")
         print(f"   Without VideoAirDate:        {without_date}")
@@ -46,16 +47,16 @@ def check_db_stats():
         if with_date > 0:
             print(f"   Earliest VideoAirDate:       {min_date}")
             print(f"   Latest VideoAirDate:         {max_date}")
-            print("✅ Some images have already been used in videos.")
+            print("Some images have already been used in videos.")
         else:
-            print("ℹ️  No images have been used in videos yet (all VideoAirDate empty).")
+            print("No images have been used in videos yet (all VideoAirDate empty).")
 
         conn.close()
 
     except sqlite3.Error as e:
-        print(f"❌ SQLite error: {e}")
+        print(f"SQLite error: {e}")
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        print(f"Unexpected error: {e}")
 
 
 if __name__ == "__main__":

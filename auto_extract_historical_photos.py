@@ -28,6 +28,13 @@ TEXT_START_SEC = 3
 STEP_SEC = 12
 IMAGE_OFFSET = 9   # image = text + 9s
 
+# Some source videos have brief motion-blur / cross-fade transitions right at
+# the fixed image_sec timestamp, producing a fuzzy/soft output photo. Instead
+# of always grabbing the single frame at exactly img_sec, we sample a few
+# nearby timestamps (within the photo's still-display window) and keep the
+# sharpest one.
+IMAGE_SEARCH_WINDOW_SEC = 2.0
+
 OUTPUT_DIR = "output"
 TEXT_FILE = "extracted_text.txt"
 EXTRA_DUPLICATE_DIRS = ("output-ready", "Output")
@@ -106,6 +113,76 @@ def extract_frame(video, second, out_file):
     except FileNotFoundError:
         print(f"Error: ffmpeg not found at {FFMPEG_PATH}")
         return False
+    return True
+
+
+def build_image_sample_timestamps(anchor_sec, search_window_sec=IMAGE_SEARCH_WINDOW_SEC):
+    """Return a small set of candidate timestamps around anchor_sec, used to
+    pick the sharpest available frame instead of trusting a single fixed
+    instant (which can occasionally land on a motion-blurred / cross-fade
+    transition frame).
+    """
+    start = max(0.0, anchor_sec - search_window_sec / 2.0)
+    end = anchor_sec + search_window_sec / 2.0
+    quarter = search_window_sec / 4.0
+    values = [start, anchor_sec - quarter, anchor_sec, anchor_sec + quarter, end]
+
+    out = []
+    seen = set()
+    for sec in values:
+        normalized = round(max(0.0, float(sec)), 2)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def quick_frame_score(image_bgr):
+    """Higher score = sharper/more detailed frame. Combines local contrast
+    (std dev) with a Laplacian-variance focus/sharpness measure, sampled from
+    the central region of the frame (avoiding the caption-bar and edges).
+    """
+    h, w = image_bgr.shape[:2]
+    if h < 16 or w < 16:
+        return -1.0
+
+    x1 = int(w * 0.18)
+    x2 = int(w * 0.82)
+    y1 = int(h * 0.05)
+    y2 = int(h * 0.85)
+    roi = image_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        roi = image_bgr
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    contrast_score = float(np.std(gray))
+    sharpness_score = float(cv2.Laplacian(gray, cv2.CV_32F).var())
+    lit_ratio = float(np.count_nonzero(gray > 20)) / max(1, gray.size)
+    return (contrast_score * 1.5) + (sharpness_score * 0.03) + (lit_ratio * 120.0)
+
+
+def find_sharpest_image_frame(video, anchor_sec, out_file, search_window_sec=IMAGE_SEARCH_WINDOW_SEC):
+    """Sample a few frames near anchor_sec and keep the sharpest one (written
+    to out_file). Returns True on success, False if no frame could be read.
+    """
+    best_img = None
+    best_score = -1.0
+    for sec in build_image_sample_timestamps(anchor_sec, search_window_sec):
+        if not extract_frame(video, sec, out_file):
+            continue
+        candidate = cv2.imread(out_file)
+        if candidate is None:
+            continue
+        score = quick_frame_score(candidate)
+        if score > best_score:
+            best_score = score
+            best_img = candidate
+
+    if best_img is None:
+        return False
+
+    cv2.imwrite(out_file, best_img)
     return True
 
 # ================= OCR =================
@@ -396,6 +473,118 @@ def check_visual_duplicate(img, duplicate_index):
     return None
 
 
+# ================= WATERMARK REMOVAL =================
+# Some source videos overlay an "Old World Photos" watermark: white translucent
+# text centered near the top of the frame, and/or gold script text on the left
+# side of the frame (both sit on the static decorative border, never on the
+# actual photo itself). Instead of cropping the frame, we detect these bright,
+# locally-high-contrast text regions and inpaint over them using the
+# surrounding background texture so the frame keeps its original size.
+#
+# Some videos also repeat the watermark a second time, tiled near the vertical
+# middle of the frame -- right on top of the photo's subject. That instance is
+# much harder to remove safely: any detector sensitive enough to pick up the
+# very faint, low-contrast watermark text there also fires on real fine detail
+# (hair, feathers, fabric texture, etc.), which would smudge genuine photo
+# content. This extra "middle band" pass is therefore OFF by default and only
+# runs when explicitly enabled, since it trades a chance of removing the
+# leftover watermark for a small risk of blurring real detail in that region.
+# Enable it by setting the environment variable WATERMARK_AGGRESSIVE=1
+# (e.g. in .env) before running the script.
+
+WATERMARK_TOP_BAND_RATIO = 0.16     # top strip (full width) checked for the centered overlay
+WATERMARK_LEFT_BAND_X_RATIO = 0.24  # left strip width checked for the script-style watermark
+WATERMARK_LEFT_BAND_Y_RANGE = (0.30, 0.72)  # vertical range (as ratio of height) of the left strip
+WATERMARK_DIFF_THRESH = 10
+WATERMARK_BLUR_KSIZE = 21
+
+# Middle-band (opt-in, "aggressive") pass config
+WATERMARK_MID_BAND_Y_RANGE = (0.38, 0.62)
+WATERMARK_MID_DIFF_THRESH = 10
+WATERMARK_MID_BLUR_KSIZE = 21
+WATERMARK_MID_MAX_AREA_RATIO = 0.06  # if more than this fraction of the band would be
+                                      # touched, assume it's real detail, not watermark,
+                                      # and skip the middle-band pass for this frame.
+
+
+def _watermark_aggressive_enabled():
+    return str(os.environ.get("WATERMARK_AGGRESSIVE", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bright_text_mask(gray_full, x0, x1, y0, y1, diff_thresh=WATERMARK_DIFF_THRESH, blur_ksize=WATERMARK_BLUR_KSIZE):
+    """Build a mask of bright, locally-contrasting pixels (likely overlay text)
+    within the given region, by comparing each pixel to a blurred (local
+    background) version of itself. Returns a full-size mask (same shape as
+    gray_full) with the detected region filled in and everywhere else zero.
+    """
+    h, w = gray_full.shape
+    x0, x1 = max(0, x0), min(w, x1)
+    y0, y1 = max(0, y0), min(h, y1)
+    roi = gray_full[y0:y1, x0:x1]
+    full_mask = np.zeros((h, w), dtype=np.uint8)
+    if roi.size == 0:
+        return full_mask
+
+    k = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+    blur = cv2.GaussianBlur(roi, (k, k), 0)
+    diff = cv2.subtract(roi, blur)
+    _, roi_mask = cv2.threshold(diff, diff_thresh, 255, cv2.THRESH_BINARY)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    roi_mask = cv2.dilate(roi_mask, kernel, iterations=1)
+
+    full_mask[y0:y1, x0:x1] = roi_mask
+    return full_mask
+
+
+def _mid_band_watermark_mask(gray):
+    """Opt-in detection of a watermark instance tiled near the vertical middle
+    of the frame. Uses a safety cap: if the detected region would cover too
+    large a fraction of the band, it's more likely real photo detail than
+    watermark text, so the whole candidate is discarded for that frame
+    (better to leave a residual watermark than to smudge a real photo).
+    """
+    h, w = gray.shape
+    y0 = int(h * WATERMARK_MID_BAND_Y_RANGE[0])
+    y1 = int(h * WATERMARK_MID_BAND_Y_RANGE[1])
+    mask = _bright_text_mask(
+        gray, 0, w, y0, y1,
+        diff_thresh=WATERMARK_MID_DIFF_THRESH,
+        blur_ksize=WATERMARK_MID_BLUR_KSIZE,
+    )
+    band_area = max(1, (y1 - y0) * w)
+    ratio = cv2.countNonZero(mask) / float(band_area)
+    if ratio > WATERMARK_MID_MAX_AREA_RATIO:
+        return np.zeros((h, w), dtype=np.uint8)
+    return mask
+
+
+def remove_watermark(img):
+    """Remove the 'Old World Photos' style watermark (top-center overlay
+    and/or left-side script text) by inpainting over detected text pixels
+    using the surrounding background. Returns the (possibly) cleaned image;
+    the image dimensions are never changed (no cropping).
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    top_mask = _bright_text_mask(gray, 0, w, 0, int(h * WATERMARK_TOP_BAND_RATIO))
+    left_y0 = int(h * WATERMARK_LEFT_BAND_Y_RANGE[0])
+    left_y1 = int(h * WATERMARK_LEFT_BAND_Y_RANGE[1])
+    left_mask = _bright_text_mask(gray, 0, int(w * WATERMARK_LEFT_BAND_X_RATIO), left_y0, left_y1)
+
+    mask = cv2.bitwise_or(top_mask, left_mask)
+
+    if _watermark_aggressive_enabled():
+        mid_mask = _mid_band_watermark_mask(gray)
+        mask = cv2.bitwise_or(mask, mid_mask)
+
+    if cv2.countNonZero(mask) == 0:
+        return img
+
+    return cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+
+
 def add_image_to_duplicate_index(img, name, duplicate_index):
     hashes = compute_hash_variants(img)
     if hashes is None:
@@ -426,14 +615,17 @@ def process_entry(video, text_sec, img_sec, index, text_path, duplicate_index):
 
     text = ocr_image(img_text)
 
-    # Extract image frame
-    if not extract_frame(video, img_sec, TEMP_IMAGE_FRAME):
+    # Extract image frame: sample a small window around img_sec and keep the
+    # sharpest frame, to avoid landing on a blurry transition/motion frame.
+    if not find_sharpest_image_frame(video, img_sec, TEMP_IMAGE_FRAME):
         return False
 
     img = cv2.imread(TEMP_IMAGE_FRAME)
     if img is None:
         print(f"Failed to read image frame at {img_sec}s")
         return False
+
+    img = remove_watermark(img)
 
     duplicate_hit = check_visual_duplicate(img, duplicate_index)
     if duplicate_hit is not None:

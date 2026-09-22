@@ -57,39 +57,34 @@ def search_text(conn: sqlite3.Connection, table: str, search_term: str):
 
     print(f"Searching table '{table}' in columns: {', '.join(columns)}")
 
+    has_filename = "filename" in columns
+    filename_expr = 'COALESCE(filename, \'(no filename)\')' if has_filename else "'(no filename)'"
+
+    # Single combined query (one table scan) instead of one scan per column.
+    select_cols = ", ".join(f'"{col}" AS "{col}"' for col in columns)
+    where_clause = " OR ".join(f'"{col}" LIKE ?' for col in columns)
+    query = f'''
+        SELECT rowid AS row_id,
+               {select_cols},
+               {filename_expr} AS display_name
+        FROM   "{table}"
+        WHERE  {where_clause}
+        ORDER BY rowid
+    '''
+    params = tuple(f"%{search_term}%" for _ in columns)
+
     results = []
-
-    for col in columns:
-        query = f'''
-            SELECT rowid          AS row_id,
-                   "{col}"        AS search_value,
-                   COALESCE(filename, '(no filename)') AS display_name
-            FROM   "{table}"
-            WHERE  "{col}" LIKE ?
-            ORDER BY rowid
-        '''
-
-        print(f"  → Query for column '{col}':")
-        print("   ", query.strip().replace('\n', '  '))
-
-        try:
-            cursor.execute(query, (f"%{search_term}%",))
-            for row in cursor.fetchall():
-                # Primary access via named keys
-                try:
-                    rowid = row['row_id']
-                    value = row['search_value'] or '(empty)'
-                    fname = row['display_name']
-                except KeyError:
-                    # Fallback to positional access
-                    rowid = row[0]
-                    value = row[1] or '(empty)'
-                    fname = row[2]
-
-                results.append((rowid, col, value, fname))
-
-        except sqlite3.Error as e:
-            print(f"  Failed querying column '{col}': {e}")
+    try:
+        cursor.execute(query, params)
+        for row in cursor.fetchall():
+            rowid = row['row_id']
+            fname = row['display_name']
+            for col in columns:
+                value = row[col]
+                if value and search_term.lower() in str(value).lower():
+                    results.append((rowid, col, value, fname))
+    except sqlite3.Error as e:
+        print(f"  Failed querying table '{table}': {e}")
 
     return results
 
