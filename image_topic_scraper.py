@@ -41,6 +41,8 @@ import io
 import os
 import re
 import time
+from collections import Counter
+from difflib import SequenceMatcher
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlparse
@@ -134,6 +136,74 @@ def _is_social_platform_url(url: str) -> bool:
         return False
     host = urlparse(url).netloc.lower()
     return any(host == d or host.endswith("." + d) for d in SOCIAL_PLATFORM_DOMAINS)
+
+
+# Wallpaper/background-download sites host real photos but their page text
+# (title, meta description, body) describes the *website's wallpaper
+# collection* ("98 free wallpapers for desktop, phone, tablet"), not the
+# photo's actual subject/history -- using that text as a caption is
+# technically-true-but-useless noise, not a description of the photo.
+WALLPAPER_HOST_DOMAINS = {
+    "wallpaperaccess.com", "wallpapercave.com", "wallpapers.com",
+    "wallpaperflare.com", "hdqwalls.com", "pngtree.com", "vecteezy.com",
+    "wallpapersafari.com", "wallpaperbetter.com", "getwallpapers.com",
+}
+
+# Link-aggregator / "suggestions" sites that mirror images alongside
+# completely unrelated content pulled from other topics -- their page title
+# can describe a totally different subject than the actual photo (e.g. an
+# American-flag article title attached to a New York City street photo).
+LINK_AGGREGATOR_DOMAINS = {
+    "fity.club",
+}
+
+
+def _is_wallpaper_host_url(url: str) -> bool:
+    if not url:
+        return False
+    host = urlparse(url).netloc.lower()
+    return any(host == d or host.endswith("." + d) for d in WALLPAPER_HOST_DOMAINS)
+
+
+def _is_link_aggregator_url(url: str) -> bool:
+    if not url:
+        return False
+    host = urlparse(url).netloc.lower()
+    return any(host == d or host.endswith("." + d) for d in LINK_AGGREGATOR_DOMAINS)
+
+
+# ================= TOPIC RELEVANCE CHECK =================
+# Scraped titles/text are sometimes completely unrelated to the actual photo
+# (mirror/aggregator sites that list unrelated "suggested" content). Before
+# trusting any scraped text as caption material, check that it actually
+# shares real keywords with the search topic -- text with zero overlap is
+# untrustworthy and should never be used, generic filler words in the topic
+# itself (like "old", "photos", "vintage") don't count as meaningful overlap.
+
+TOPIC_FILLER_WORDS = {
+    "old", "photo", "photos", "photograph", "photographs", "picture",
+    "pictures", "image", "images", "vintage", "rare", "historical",
+    "history", "antique", "classic", "of", "the", "in", "and", "for",
+    "a", "an", "from",
+}
+
+
+def _topic_keywords(topic: str):
+    words = re.findall(r"[A-Za-z0-9]+", (topic or "").lower())
+    return {w for w in words if w not in TOPIC_FILLER_WORDS and len(w) >= 3}
+
+
+def _text_matches_topic(text: str, topic_keywords: set) -> bool:
+    """True if text shares at least one meaningful keyword with the topic,
+    or if the topic had no meaningful keywords to check against (nothing to
+    compare, so we can't rule it out).
+    """
+    if not topic_keywords:
+        return True
+    if not text:
+        return False
+    text_words = set(re.findall(r"[A-Za-z0-9]+", text.lower()))
+    return bool(topic_keywords & text_words)
 
 
 def slugify(text: str) -> str:
@@ -328,6 +398,11 @@ BOILERPLATE_RE = re.compile(
         | \bif\s+you\s+liked\s+this\s+post\b
         | \bcheck\s+out\s+these\s+(popular\s+)?posts\b
         | \brelated\s+posts\b
+        | \bfree\s+wallpapers?\b
+        | \bwallpapers?\s+(and|or)\s+backgrounds?\b
+        | \bfor\s+(your\s+)?(desktop|phone|tablet|mobile|smartphone)s?\b
+        | \bhd\s+(wallpaper|images?)s?\b
+        | \bhome\s+screen\b
     )""",
     re.IGNORECASE | re.VERBOSE,
 )
@@ -412,9 +487,71 @@ def _strip_credit_lines(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip(" -|,")
 
 
-def fetch_page_content(source_url: str):
+def _image_url_basename(url: str) -> str:
+    """Extract a comparable filename/basename from an image URL, stripping
+    query strings and common CDN resize suffixes so it can be matched
+    against <img src="..."> attributes found in the page HTML.
+    """
+    if not url:
+        return ""
+    path = urlparse(url).path
+    name = os.path.basename(path).lower()
+    return name
+
+
+def _extract_image_specific_caption(soup: BeautifulSoup, image_url: str):
+    """Best-effort: find the <img> tag on the page whose src/srcset matches
+    image_url, then read its nearby caption (figcaption, alt text, or an
+    adjacent <em>/<p> -- the common WordPress/blog "photo caption" pattern).
+
+    This matters because many source pages are multi-photo galleries/
+    listicles ("36 vintage photos of X") where a single page hosts dozens of
+    different photos, each with its own specific caption. Falling back to
+    the page's overall title/meta description/body text in that case risks
+    describing a completely different photo than the one actually
+    downloaded. Returns None if no confident match is found.
+    """
+    target = _image_url_basename(image_url)
+    if not target:
+        return None
+
+    for img in soup.find_all("img"):
+        candidates = [img.get("src", ""), img.get("data-src", ""), img.get("srcset", "")]
+        if not any(target in c.lower() for c in candidates if c):
+            continue
+
+        # 1) <figure><img>...<figcaption>caption</figcaption></figure>
+        figure = img.find_parent("figure")
+        if figure:
+            figcaption = figure.find("figcaption")
+            if figcaption:
+                text = _fix_text_encoding(unescape(figcaption.get_text(" ", strip=True)))
+                if len(text) >= 15 and not _is_junk_line(text):
+                    return text
+
+        # 2) Non-empty, descriptive alt text (skip generic/empty alts)
+        alt = _fix_text_encoding(unescape((img.get("alt") or "").strip()))
+        if len(alt) >= 15 and not _is_junk_line(alt):
+            return alt
+
+        # 3) A caption-styled tag immediately following the image (common in
+        # WordPress posts: <img>...<p><em>Caption text.</em></p>)
+        sibling = img.find_next(["em", "i", "small", "p"])
+        if sibling:
+            text = _fix_text_encoding(unescape(sibling.get_text(" ", strip=True)))
+            if 15 <= len(text) <= 300 and not _is_junk_line(text):
+                return text
+
+        return None  # matched the image but found no usable caption nearby
+
+    return None
+
+
+def fetch_page_content(source_url: str, image_url: str = None):
     """Fetch a page once and return a dict of useful text signals:
-      title, meta_description, paragraphs (list of body paragraph strings)
+      title, meta_description, paragraphs (list of body paragraph strings),
+      image_caption (a caption tied specifically to image_url, if found --
+      see _extract_image_specific_caption)
     Returns None if the page could not be fetched.
     """
     if not source_url:
@@ -456,7 +593,14 @@ def fetch_page_content(source_url: str):
             if len(paragraphs) >= 6:
                 break
 
-        return {"title": title, "meta_description": meta_description, "paragraphs": paragraphs}
+        image_caption = _extract_image_specific_caption(soup, image_url) if image_url else None
+
+        return {
+            "title": title,
+            "meta_description": meta_description,
+            "paragraphs": paragraphs,
+            "image_caption": image_caption,
+        }
     except Exception as e:
         print(f"  [WARN] could not fetch page content from {source_url}: {e}")
         return None
@@ -572,24 +716,103 @@ def _strip_reasoning_block(text: str) -> str:
     return THINK_BLOCK_RE.sub("", text).strip()
 
 
-def generate_interesting_description(topic: str, title: str, page: dict):
+YEAR_RE = re.compile(r"\b(1[5-9]\d{2}|20[0-4]\d)\b")
+
+
+def _extract_years(text: str) -> set:
+    return set(YEAR_RE.findall(text or ""))
+
+
+def _is_grounded(generated_text: str, context_text: str) -> bool:
+    """Reject captions where the LLM invents a specific year that appears
+    nowhere in the scraped context -- a strong, easy-to-check signal of
+    hallucination (fabricating a vivid-sounding but made-up date/event) when
+    the source page had little or no real information about the photo.
+    """
+    generated_years = _extract_years(generated_text)
+    if not generated_years:
+        return True
+    context_years = _extract_years(context_text)
+    return generated_years.issubset(context_years)
+
+
+def _context_is_substantive(page: dict, image_caption) -> bool:
+    """True if there is real, substantive scraped text to ground a caption in
+    (a matched per-image caption, real body paragraphs, or a meaningful meta
+    description) -- as opposed to just a bare page title. Thin/near-empty
+    context is exactly when a local LLM is most likely to fabricate a
+    plausible-sounding but entirely made-up "fact" instead of admitting it
+    has nothing to say.
+    """
+    if image_caption:
+        return True
+    if not page:
+        return False
+    if page.get("paragraphs"):
+        return True
+    meta = page.get("meta_description") or ""
+    return len(meta) >= 40
+
+
+def generate_interesting_description(topic: str, title: str, page: dict, is_gallery_page: bool = False):
     """Ask a local LLM (Ollama, preferred) or OpenAI (fallback) for one or
     two interesting, factual sentences about the photo itself, using the
     scraped title/description/body text as context. Returns None if no LLM
-    is available or the call fails, so the caller can fall back to the
-    heuristic path.
+    is available, there isn't enough real context to ground a factual
+    caption in, the generated caption looks hallucinated (invents a year not
+    present anywhere in the source text), or the call fails -- in all of
+    those cases the caller falls back to the heuristic (non-generative) path.
+
+    is_gallery_page: True when the source page is known to host multiple
+    different photos (a listicle/gallery, e.g. "45 vintage photos of X").
+    In that case the page's generic body text/meta description may describe
+    a *different* photo than the one actually downloaded, so it is excluded
+    from context unless we found a caption tied specifically to this image
+    (page['image_caption']).
     """
     resolved = _get_llm_client()
     if resolved is None:
         return None
     client, model = resolved
 
-    context_bits = [title]
-    if page:
-        if page.get("meta_description"):
-            context_bits.append(page["meta_description"])
-        context_bits.extend(page.get("paragraphs", [])[:3])
-    context = "\n".join(b for b in context_bits if b)[:2500]
+    image_caption = page.get("image_caption") if page else None
+
+    # Guard against hallucination: if there's no real, specific text to
+    # ground a caption in, don't ask the LLM to invent one -- a nearly-empty
+    # source page (e.g. a generic wallpaper listing) is exactly the scenario
+    # where a local model is prone to fabricating a vivid but fake "fact".
+    if not _context_is_substantive(page, image_caption):
+        return None
+
+    if image_caption:
+        # We matched this exact <img> tag on the page and found its own
+        # caption/alt text -- this is trustworthy, photo-specific context.
+        context = f'Caption specifically written for this exact photo: "{image_caption}"\nPage title: {title}'
+        specificity_note = (
+            "The caption above describes this exact photo and is reliable. "
+            "You may lightly rephrase it into a natural sentence, but do not add "
+            "invented details beyond what it says."
+        )
+    elif is_gallery_page:
+        # No per-image caption could be matched, and this page hosts many
+        # different photos -- its body text is NOT reliably about this
+        # specific image, so it is deliberately withheld from context.
+        context = f"Page title (this photo is one of several from a larger photo collection): {title}"
+        specificity_note = (
+            "You do NOT have any text that specifically describes this exact photo "
+            "(only the title of the larger collection it came from). Do NOT invent "
+            "specific visual details, actions, people, or events that you cannot "
+            "confirm. If you cannot say anything both specific and true, respond "
+            "with exactly: NONE"
+        )
+    else:
+        context_bits = [title]
+        if page:
+            if page.get("meta_description"):
+                context_bits.append(page["meta_description"])
+            context_bits.extend(page.get("paragraphs", [])[:3])
+        context = "\n".join(b for b in context_bits if b)[:2500]
+        specificity_note = ""
 
     prompt = f"""You are writing a short caption for a historical/interest photo used in a video slideshow.
 
@@ -601,11 +824,17 @@ actually about the photo):
 
 {context}
 
+{specificity_note}
+
 Write ONE or maximum TWO sentences describing something genuinely interesting
 or informative about this specific photo (who/what/where/when, or an
 interesting fact about it). 
 
 Rules (very important):
+- ONLY use facts, years, dates, names, and events that literally appear in the
+  text above. Do NOT invent or guess a year, date, named ship/building/person,
+  or event that is not explicitly given -- fabricating a plausible-sounding
+  detail is strictly forbidden, even if the text is thin.
 - Do NOT mention the publication, website, news outlet, or photographer credit
   (no "BBC News", "Associated Press", "Getty Images", "The New York Times", etc.)
 - Do NOT output section labels like "Opinion" or "News"
@@ -633,6 +862,11 @@ Rules (very important):
     result = re.sub(r"\s+", " ", result).strip()
     if not result or result.upper() == "NONE" or _is_junk_line(result):
         return None
+
+    if not _is_grounded(result, context):
+        print(f"  [WARN] discarding likely-hallucinated caption (invented a year not in source text): {result[:100]}")
+        return None
+
     return result
 
 
@@ -646,20 +880,31 @@ def _first_title_segment(title: str) -> str:
     return match[0].strip()
 
 
-def _heuristic_description(title: str, page: dict) -> str:
-    """Fallback path (no OpenAI available): pick the best 1-2 non-junk
-    sentences from the page's body paragraphs (preferred, since these are
-    full sentences) or its meta description (often truncated by the site
-    itself with no visible '...', so only used if no paragraph text worked),
-    otherwise fall back to the cleaned title.
+def _heuristic_description(title: str, page: dict, is_gallery_page: bool = False) -> str:
+    """Fallback path (no LLM available, or the LLM declined): pick the best
+    1-2 non-junk sentences of context, otherwise fall back to the cleaned
+    title.
+
+    Priority order:
+      1. page['image_caption'] -- text tied specifically to this exact photo
+         (found by matching its <img> tag on the page), always safe to use.
+      2. page['paragraphs'] / page['meta_description'] -- generic page-level
+         text. Only used when is_gallery_page is False, since on a gallery/
+         listicle page (many different photos, one shared page) this text
+         may describe a different photo entirely.
+      3. The page/article title -- never claims specific visual details, so
+         always safe even on a gallery page.
     """
     title = _first_title_segment((title or "").strip())
 
     candidates = []
     if page:
-        candidates.extend(page.get("paragraphs", []))
-        if page.get("meta_description"):
-            candidates.append(page["meta_description"])
+        if page.get("image_caption"):
+            candidates.append(page["image_caption"])
+        if not is_gallery_page:
+            candidates.extend(page.get("paragraphs", []))
+            if page.get("meta_description"):
+                candidates.append(page["meta_description"])
 
     for candidate in candidates:
         was_truncated = _is_truncated(candidate)
@@ -688,31 +933,146 @@ def _heuristic_description(title: str, page: dict) -> str:
     return title
 
 
-def resolve_description_text(topic: str, title: str, source_url: str) -> str:
+DESCRIPTION_SIMILARITY_THRESHOLD = 0.55
+
+# A topic-only label is worse than no label: it tells the video generator
+# nothing about the individual image and can result in a caption that is
+# unrelated to what is actually visible.  Keep a small set of generic words
+# out of the specificity check so descriptions must contribute some detail
+# beyond merely repeating the search topic.
+DESCRIPTION_GENERIC_WORDS = {
+    "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "is",
+    "of", "on", "or", "the", "to", "with", "about", "related", "photo",
+    "photograph", "picture", "image", "shows", "showing", "depicts", "scene",
+    "view", "vintage", "historic", "historical", "old", "classic", "premium",
+    "inside", "see", "more", "than", "years", "back", "this", "that",
+}
+
+
+def is_photo_specific_description(description: str, topic: str) -> bool:
+    """Return whether *description* says something about this individual photo.
+
+    Search-result titles frequently repeat only the query (for example,
+    ``Old school classrooms``).  That is useful for finding an image but not
+    for explaining what is in it.  A valid stored description therefore needs
+    at least two meaningful words beyond the topic itself and cannot use the
+    former generic fallback wording.
+    """
+    description = (description or "").strip()
+    if not description:
+        return False
+    if re.fullmatch(r"A photo related to .+\.?", description, flags=re.IGNORECASE):
+        return False
+
+    topic_words = _topic_keywords(topic)
+    words = re.findall(r"[A-Za-z0-9]+", description.lower())
+    detail_words = {
+        word for word in words
+        if len(word) >= 3 and word not in topic_words and word not in DESCRIPTION_GENERIC_WORDS
+    }
+    return len(detail_words) >= 2
+
+
+def _normalize_for_similarity(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _description_similarity(a: str, b: str) -> float:
+    na, nb = _normalize_for_similarity(a), _normalize_for_similarity(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    seq_ratio = SequenceMatcher(None, na, nb).ratio()
+    ta, tb = set(na.split()), set(nb.split())
+    union = ta | tb
+    jaccard = (len(ta & tb) / float(len(union))) if union else 0.0
+    return max(seq_ratio, jaccard)
+
+
+def find_reused_description(description: str, used_descriptions: list):
+    """Safety net for the gallery-page mismatch problem: if this description
+    is near-identical to one already used for a *different* photo earlier in
+    this run, it's very likely describing the wrong image (e.g. two photos
+    from the same multi-photo listicle page ended up with the same reused
+    caption). Returns True if a near-duplicate is found.
+    """
+    for prior in used_descriptions:
+        if _description_similarity(description, prior) >= DESCRIPTION_SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
+def resolve_description_text(topic: str, title: str, source_url: str, image_url: str = None,
+                              is_gallery_page: bool = False) -> str:
     """Return a clean, complete-sentence description (1-2 sentences) for the
     info file: never containing the source link or publication/credit
-    references, never a bare section label like "Opinion.", and never ending
-    in a dangling '...'.
+    references, never a bare section label like "Opinion.", never ending in
+    a dangling '...', and never built from text that has nothing to do with
+    the search topic (e.g. a link-aggregator page whose title/body describes
+    a completely unrelated subject).
+
+    is_gallery_page should be True when source_url is shared by multiple
+    different downloaded photos this run (a listicle/gallery page) -- see
+    generate_interesting_description / _heuristic_description for why that
+    matters (prevents describing the wrong photo from the same page).
     """
     raw_title = (title or "").strip()
-    page = None if _is_social_platform_url(source_url) else fetch_page_content(source_url)
 
-    description = generate_interesting_description(topic, raw_title, page)
+    # Wallpaper/background-download sites and link-aggregator "suggestions"
+    # pages never have real editorial text about the specific photo -- their
+    # title/body describes the site's wallpaper collection, or (for
+    # aggregators) can be about a completely different topic entirely.
+    # Skip fetching their page content outright, same as social platforms.
+    skip_page_fetch = (
+        _is_social_platform_url(source_url)
+        or _is_wallpaper_host_url(source_url)
+        or _is_link_aggregator_url(source_url)
+    )
+    page = None if skip_page_fetch else fetch_page_content(source_url, image_url)
+
+    topic_keywords = _topic_keywords(topic)
+    image_caption = page.get("image_caption") if page else None
+
+    # A caption tied specifically to this exact <img> tag is trustworthy
+    # regardless of the overall page's topic (it directly describes this
+    # photo). Everything else -- the raw title, meta description, and body
+    # paragraphs -- must share real keywords with the search topic, or it's
+    # discarded as untrustworthy/unrelated content (e.g. an aggregator page
+    # title about a totally different subject).
+    if not image_caption:
+        if not _text_matches_topic(raw_title, topic_keywords):
+            raw_title = ""
+        if page:
+            if not _text_matches_topic(page.get("meta_description", ""), topic_keywords):
+                page["meta_description"] = ""
+            page["paragraphs"] = [
+                p for p in page.get("paragraphs", []) if _text_matches_topic(p, topic_keywords)
+            ]
+
+    description = generate_interesting_description(topic, raw_title, page, is_gallery_page)
     if not description:
-        description = _heuristic_description(raw_title, page)
+        description = _heuristic_description(raw_title, page, is_gallery_page)
 
     description = _strip_credit_lines(description)
     description = _trim_to_last_complete_sentence(description) or description.strip()
     description = _strip_unbalanced_quote(description)
 
-    if _is_junk_line(description):
-        # Last-resort fallback so we never write an empty/junk-only line.
-        # Never reuse the raw title unchecked here -- it may itself be junk
-        # (e.g. a YouTube channel name like "Youtube - @Some Channel").
+    if _is_junk_line(description) or not _text_matches_topic(description, topic_keywords):
+        # Last-resort fallback so we never write an empty/junk-only/off-topic
+        # line. Never reuse the raw title unchecked here -- it may itself be
+        # junk or off-topic (e.g. a YouTube channel name, or an unrelated
+        # aggregator-page title).
         fallback_title = _first_title_segment(raw_title)
-        if _is_truncated(fallback_title) or _is_junk_line(fallback_title):
+        if (
+            _is_truncated(fallback_title)
+            or _is_junk_line(fallback_title)
+            or not _text_matches_topic(fallback_title, topic_keywords)
+        ):
             fallback_title = ""
-        description = fallback_title or f"A photo related to '{topic}'"
+        description = fallback_title
 
     if description and not re.search(r"[.!?]$", description):
         description += "."
@@ -781,10 +1141,19 @@ def download_images(topic: str, count: int, outdir: Path):
         print("No results found for that topic.")
         return []
 
+    # A source URL that appears more than once across the candidate pool is a
+    # multi-photo gallery/listicle page (e.g. "45 vintage photos of X") --
+    # its generic body text can describe any one of many different photos,
+    # so it needs extra caution in resolve_description_text (see is_gallery_page).
+    source_url_counts = Counter(
+        (c.get("url") or c.get("source") or "") for c in candidates
+    )
+
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ImageTopicScraper/1.0)"}
 
     saved = []
     info_lines = []
+    used_descriptions = []  # every accepted description this run (mismatch safety net)
     seen_images = []  # exact_hash/dhash of every image saved so far this run
     n = 0
     # Start with a fresh, empty info file -- it's rewritten after every saved
@@ -820,6 +1189,24 @@ def download_images(topic: str, count: int, outdir: Path):
                 print(f"Skipping {duplicate_reason}: {image_url}")
                 continue
 
+            title = _fix_text_encoding(unescape((item.get("title") or "").strip())) or f"Image related to '{topic}'"
+            source = item.get("url") or item.get("source") or ""
+            is_gallery_page = source_url_counts.get(source, 0) > 1
+
+            description = resolve_description_text(topic, title, source, image_url, is_gallery_page)
+
+            if find_reused_description(description, used_descriptions):
+                # This description is near-identical to one already used for
+                # a different photo.  It likely belongs to a different image
+                # in a gallery, so do not retain the image with a generic
+                # substitute caption.
+                print("Skipping image: description matched an earlier entry (likely wrong-photo caption)")
+                continue
+
+            if not is_photo_specific_description(description, topic):
+                print("Skipping image: no reliable photo-specific description available")
+                continue
+
             n += 1
             ext = guess_extension(image_url, content_type)
             filename = f"{slug}--{n}{ext}"
@@ -832,11 +1219,7 @@ def download_images(topic: str, count: int, outdir: Path):
                 "dhash": compute_dhash(resp.content),
             })
 
-            title = _fix_text_encoding(unescape((item.get("title") or "").strip())) or f"Image related to '{topic}'"
-            source = item.get("url") or item.get("source") or ""
-
-            description = resolve_description_text(topic, title, source)
-
+            used_descriptions.append(description)
             info_lines.append(f"{n} | {description}")
             saved.append(filename)
             # Rewrite info.txt after every image (cheap for a text file this
